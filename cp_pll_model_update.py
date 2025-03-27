@@ -1,0 +1,208 @@
+from math import pi
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.optimize import root_scalar
+
+def cp_pll_ode(t, y, params, ip):
+    """
+    ODE for the CP-PLL loop filter + phase error, with constant ip over this sub-interval.
+    y = [theta_e, v_c1, v_c2]
+    ip = current (A) [could be +I_p, -I_p, or 0, constant in sub-interval]
+    params = { 'C1':..., 'C2':..., 'R1':..., 'R2':..., 'Kvco':..., 'wref':... }
+    """
+    theta_e, vc1, vc2 = y
+    C1 = params["C1"]
+    C2 = params["C2"]
+    R1 = params["R1"]
+    R2 = params["R2"]
+    Kvco = params["Kvco"]
+    wref = params["wref"]
+    wfr = params["wfr"]
+    # ODEs
+    # dtheta_dt = wref - (Kvco * vc2 + 20e9) / 160
+    dtheta_dt = wref - (Kvco * vc1 + wfr) / 160
+    dvc1_dt = ip/C2 + vc2/R1/C2 - vc1/R1/C2
+    dvc2_dt = vc1/R1/C1 - vc2/R1/C1
+
+    return [dtheta_dt, dvc1_dt, dvc2_dt]
+
+def boundary_condition_eq20(tp, init_cond, params, ip):
+    """
+    Example boundary function for eq. (20), valid when theta_e(0) > 0.
+    Integrate from t=0 to t=tp with charge pump ip, then define f(tp)=0 condition.
+    """
+    sol = solve_ivp(cp_pll_ode, (0, tp), init_cond, args=(params, ip), max_step=1e-8, dense_output=False)
+    # final phase error
+    theta_e_tp = sol.y[0, -1]
+    # Example: eq. (20) might say "phase changes by 2*pi" => f(tp) = [theta_e(tp) - (theta_e(0)-2pi)] 
+    theta_e0 = init_cond[0]
+    print(theta_e_tp)
+    print(theta_e0)
+    print(f"result is {theta_e_tp - theta_e0}")
+    return theta_e_tp - (theta_e0 - 2 * np.pi)
+
+def solve_tp_eq20(init_cond, params, ip, T_cycle):
+    """
+    Solve for tp in [0..T_cycle] with eq. (20)'s boundary condition.
+    """
+    def f_tp(tp):
+        return boundary_condition_eq20(tp, init_cond, params, ip)
+    bracket_min, bracket_max = 0.0, T_cycle
+    res = root_scalar(f_tp, bracket=[bracket_min, bracket_max], method="bisect")
+    if res.converged:
+        return res.root
+    else:
+        return 0.0  # fallback
+
+
+def boundary_condition_eq24(t_p, T, state_tp, params):
+    """
+    Integrate from t_p to T with ip=0, then compute eq(24).
+    Return f(T), the boundary function we want = 0 for solution.
+    """
+    # state_tp => [theta_e(tp), v_c1(tp), v_c2(tp)]
+    sol_off = solve_ivp(
+        cp_pll_ode,
+        (t_p, T),
+        state_tp,
+        args=(params, 0.0),
+        dense_output=False
+    )
+    final_state = sol_off.y[:, -1]
+    # eq(24) might say something like: theta_e(T) = etc, or integral of v_c1(t) = ...
+    # We'll just do a placeholder:
+    theta_e_T = final_state[0]
+    theta_e_tp = state_tp[0]
+    print(theta_e_T)
+    print(theta_e_tp)
+    print(f"error= {theta_e_T - theta_e_tp}")
+    # eq(24) => f(T) = [theta_e(T) - (some expression)]
+    return -theta_e_T + theta_e_tp - 2 * np.pi   # placeholder
+
+def solve_T_eq24(t_p, state_tp, params, bracket=(0.0, 1e-6)):
+    def f_T(T):
+        return boundary_condition_eq24(t_p, T, state_tp, params)
+    from scipy.optimize import root_scalar
+    res = root_scalar(f_T, bracket=bracket)
+    if res.converged:
+        return res.root
+    return bracket[0]
+
+def simulate_one_cycle(init_cond, params, T_cycle):
+    """
+    Simulate from t=0..T_cycle in two segments (CP on, CP off),
+    picking eq. (20) if theta_e(0)>0, eq. (18) if theta_e(0)<0.
+    """
+    theta_e0 = init_cond[0]
+    
+    # Decide sign => direction of IP
+    if theta_e0 > 0:
+        ip_on = +params["I_p"]
+        t_p = solve_tp_eq20(init_cond, params, ip_on, T_cycle)
+        print(f"t_p = {t_p}")
+    else:
+        ip_on = -params["I_p"]
+        t_p = solve_tp_eq20(init_cond, params, ip_on, T_cycle)
+    if t_p > T_cycle:
+        t_p = T_cycle
+
+    # Integrate sub-interval [0..t_p] with CP on
+    sol_on = solve_ivp(cp_pll_ode, (0, t_p), init_cond, args=(params, ip_on),max_step=1e-10,dense_output=True)
+    state_tp = sol_on.y[:, -1]
+    T_calc = solve_T_eq24(t_p, state_tp, params)
+    print(f"T_calc is {T_calc}")
+    # calc the T_ through equation 21-24
+    # Integrate sub-interval [t_p..T_cycle] with CP off
+    sol_off = solve_ivp(cp_pll_ode, (t_p, T_calc), state_tp, args=(params, 0.0), max_step=1e-8,dense_output=True)
+    state_end = sol_off.y[:, -1]
+
+    # Combine times and states
+    t_on = sol_on.t
+    y_on = sol_on.y
+    t_off = sol_off.t
+    y_off = sol_off.y
+
+    # Avoid duplication of last point from sol_on
+    if t_off[0] == t_on[-1]:
+        t_off = t_off[1:]
+        y_off = y_off[:, 1:]
+
+    t_full = np.concatenate((t_on, t_off))
+    y_full = np.concatenate((y_on, y_off), axis=1)
+    
+    return state_end, t_full, y_full, T_calc
+
+
+
+def run_transient(init_cond, params, T_cycle, n_cycles=10):
+    """
+    Run n_cycles in a row, concatenating time + states for a full transient.
+    """
+    y_current = init_cond
+    t_global = []
+    y_global = []
+    current_t_offset = 0.0
+
+    for cycle_index in range(n_cycles):
+        state_end, t_full, y_full, t_p = simulate_one_cycle(y_current, params, T_cycle)
+        
+        # Shift the time array by current_t_offset so it's global
+        t_shifted = t_full + current_t_offset
+        
+        # Store
+        if cycle_index == 0:
+            t_global = t_shifted
+            y_global = y_full
+        else:
+            # remove the duplicate start
+            t_shifted = t_shifted[1:]
+            y_full = y_full[:, 1:]
+            t_global = np.concatenate((t_global, t_shifted))
+            y_global = np.concatenate((y_global, y_full), axis=1)
+        
+        # Prepare for next cycle
+        y_current = state_end
+        current_t_offset += t_p
+
+    return t_global, y_global
+# -------------------- Example usage --------------------
+if __name__ == "__main__":
+    # Parameters
+    params = {
+
+        "Kcp": 100e-6/2/np.pi,  # Charge pump current [A]
+        "Kvdd": 20e9 * 2 * np.pi,
+        "Cff" : 150e-15,
+        "A": 100, # error amp gain
+        "wp": 10e3 * 2 * np.pi,
+        "C1": 65e-12,
+        "C2": 5e-12,
+        "R1": 20e3,
+        "R2": 1e3,
+        "Kvco": 3e9 * 2 * np.pi,      # [rad/(s*V)]
+        "wref": 100e6 * 2* np.pi,      # reference freq [rad/s]
+        "I_p": 100e-6,       # CP current [A]
+        "wfr": 14e9 * 2 * np.pi
+    }
+
+    # initial conditions: y = [theta_e, vc1, vc2]
+    y0 = [0.1, 0.0, 0.0]     # start with some positive phase error
+    T_minus = 1e-5     # total interval for one cycle, for example
+
+    # Simulate one "cycle" from t=0..T_minus
+    # final_state, tp_found, sol_on, sol_off = simulate_one_cycle(y0, params, T_minus)
+
+
+    t_global, y_global = run_transient(y0, params, T_minus, 100)
+
+    # y_global.shape => (3, # of time samples)
+    # Plot or analyze
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.subplot(2,1,1)
+    plt.plot(t_global, y_global[0], label="theta_e")
+    plt.subplot(2,1,2)
+    plt.plot(t_global, y_global[1], label="v_c1")
+    plt.plot(t_global, y_global[2], label="v_c2")
+    plt.legend()
+    plt.show()
