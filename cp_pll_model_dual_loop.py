@@ -28,7 +28,7 @@ def cp_pll_ode(t, y, params, ip):
     A = params["A"]
     # ODEs
     # dtheta_dt = wref - (Kvco * vc2 + 20e9) / 160
-    dtheta_dt = wref - (Kvco * vc2 + wfr - Kvdd * vc4) / 160
+    dtheta_dt = wref - (Kvco * vc2 + wfr + Kvdd * vc4) / 160
     dvc1_dt = vc3 / R1 / C1 - vc1 / R1 / C1
     dvc2_dt = vc3 / R2 / C2 - vc2 / R2 / C2
     dvc3_dt = ip / Cff - vc3 * (1 / R1 + 1 / R2) / Cff + vc1 / R1 / Cff + vc2 / R2 / Cff + A * wp * vc1 - A * wp * 0.375 - wp * vc4
@@ -125,13 +125,12 @@ def simulate_one_cycle(init_cond, params, t_per):
 
     state_end = sol_off.y[:, -1]
 
-    # Combine times and states
+
     t_on = sol_on.t
     y_on = sol_on.y
     t_off = sol_off.t
     y_off = sol_off.y
 
-    # Avoid duplication of last point from sol_on
     if t_off[0] == t_on[-1]:
         t_off = t_off[1:]
         y_off = y_off[:, 1:]
@@ -151,69 +150,72 @@ def run_transient(init_cond, params, T_cycle, n_cycles=1000):
     t_global = []
     y_global = []
     current_t_offset = 0.0
-    print(f"current_state = {y_current}")
     for cycle_index in range(n_cycles):
+        print(f"current_state = {y_current}")
         state_end, t_full, y_full, t_p = simulate_one_cycle(y_current, params, T_cycle)
         
-        # Shift the time array by current_t_offset so it's global
+
         t_shifted = t_full + current_t_offset
-        
-        # Store
+
         if cycle_index == 0:
             t_global = t_shifted
             y_global = y_full
         else:
-            # remove the duplicate start
+
             t_shifted = t_shifted[1:]
             y_full = y_full[:, 1:]
             t_global = np.concatenate((t_global, t_shifted))
             y_global = np.concatenate((y_global, y_full), axis=1)
         
-        # Prepare for next cycle
+ 
         y_current = state_end
         current_t_offset += t_p
 
     return t_global, y_global
-# -------------------- Example usage --------------------
+
 if __name__ == "__main__":
-    # Parameters
+
     params = {
 
         "Kcp": 100e-6/2/np.pi,  # Charge pump current [A]
         "Kvdd": 20e9 * 2 * np.pi,
-        "Cff" : 150e-15,
-        "A": 100, # error amp gain
-        "wp": 10e3 * 2 * np.pi,
-        "C1": 65e-12,
-        "C2": 5e-12,
-        "R1": 20e3,
-        "R2": 1e3,
+        "Cff" : 300e-15,
+        "A": 10, # error amp gain
+        "wp": 1e3 * 2 * np.pi,
+        "C1": 40e-12,
+        "C2": 2e-12,
+        "R1": 15e3,
+        "R2": 5e3,
         "Kvco": 3e9 * 2 * np.pi,      # [rad/(s*V)]
         "wref": 100e6 * 2* np.pi,      # reference freq [rad/s]
-        "I_p": 100e-6,       # CP current [A]
+        "I_p": 25e-6,       # CP current [A]
         "wfr": 14.875e9 * 2 * np.pi
     }
 
-    # initial conditions: y = [theta_e, vc1, vc2]
-    y0 = [-1, 0.0, 0.0, 0.0 , 0.0]     # start with some positive phase error
-    T_minus = 1e-8     # total interval for one cycle, for example
-
-    # Simulate one "cycle" from t=0..T_minus
-    # final_state, tp_found, sol_on, sol_off = simulate_one_cycle(y0, params, T_minus)
+ 
+    y0 = [3, 0.0, 0.0, 0.0 , 0]     
+    T_minus = 1e-8     
 
 
-    t_global, y_global = run_transient(y0, params, T_minus,50)
 
-    # y_global.shape => (3, # of time samples)
-    # Plot or analyze
+    t_global, y_global = run_transient(y0, params, T_minus,1000)
+
+
     import matplotlib.pyplot as plt
     plt.figure()
-    plt.subplot(2,1,1)
+    plt.subplot(5,1,1)
     plt.plot(t_global, y_global[0], label="theta_e")
-    plt.subplot(2,1,2)
+    plt.legend()
+    plt.subplot(5,1,2)
     plt.plot(t_global, y_global[1], label="v_c1")
+    plt.legend()
+    plt.subplot(5,1,3)
     plt.plot(t_global, y_global[2], label="v_c2")
+    plt.legend()
+    plt.subplot(5,1,4)
     plt.plot(t_global, y_global[3], label="v_c3")
+    plt.legend()
+    plt.subplot(5,1,5)
     plt.plot(t_global, y_global[4], label="v_c4")
     plt.legend()
     plt.show()
